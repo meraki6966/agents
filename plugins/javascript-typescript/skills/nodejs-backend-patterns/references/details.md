@@ -57,7 +57,10 @@ const fastify = Fastify({
 
 // Plugins
 await fastify.register(helmet);
-await fastify.register(cors, { origin: true });
+// Explicit allowlist. `origin: true` reflects any origin back to the caller.
+await fastify.register(cors, {
+  origin: process.env.ALLOWED_ORIGINS?.split(",") ?? false,
+});
 await fastify.register(compress);
 
 // Type-safe routes with schema validation
@@ -180,7 +183,7 @@ export class UserService {
     }
 
     // Hash password
-    const hashedPassword = await bcrypt.hash(userData.password, 10);
+    const hashedPassword = await bcrypt.hash(userData.password, 12);
 
     // Create user
     const user = await this.userRepository.create({
@@ -258,9 +261,20 @@ export class UserRepository {
     return rows[0] || null;
   }
 
+  // Values can be parameterized. Column names cannot, so they come from a
+  // fixed allowlist and never from the keys of a client-supplied object.
+  // A TypeScript type does not strip extra keys at runtime: without this,
+  // a body of { "role": "admin" } or a key carrying SQL reaches the query.
+  private static readonly UPDATABLE_COLUMNS = ["name", "email"] as const;
+
   async update(id: string, updates: UpdateUserDTO): Promise<UserEntity | null> {
-    const fields = Object.keys(updates);
-    const values = Object.values(updates);
+    const fields = UserRepository.UPDATABLE_COLUMNS.filter(
+      (column) => updates[column] !== undefined,
+    );
+    if (fields.length === 0) {
+      return this.findById(id);
+    }
+    const values = fields.map((column) => updates[column]);
 
     const setClause = fields
       .map((field, idx) => `${field} = $${idx + 2}`)
@@ -280,7 +294,7 @@ export class UserRepository {
   async delete(id: string): Promise<boolean> {
     const query = "DELETE FROM users WHERE id = $1";
     const { rowCount } = await this.db.query(query, [id]);
-    return rowCount > 0;
+    return (rowCount ?? 0) > 0;
   }
 }
 ```
@@ -324,7 +338,9 @@ export const authenticate = async (
       throw new UnauthorizedError("No token provided");
     }
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET!) as JWTPayload;
+    const payload = jwt.verify(token, process.env.JWT_SECRET!, {
+      algorithms: ["HS256"],
+    }) as JWTPayload;
 
     req.user = payload;
     next();
@@ -384,13 +400,37 @@ export const validate = (schema: AnyZodObject) => {
 
 // Usage with Zod
 import { z } from "zod";
+import { ZxcvbnFactory } from "@zxcvbn-ts/core";
+import * as zxcvbnCommon from "@zxcvbn-ts/language-common";
+import * as zxcvbnEn from "@zxcvbn-ts/language-en";
+
+// Password strength is a measured estimate. A length or composition rule
+// accepts "Password1234!"; the estimator scores it 1 of 4 and it is rejected.
+const zxcvbn = new ZxcvbnFactory({
+  dictionary: { ...zxcvbnCommon.dictionary, ...zxcvbnEn.dictionary },
+  graphs: zxcvbnCommon.adjacencyGraphs,
+  translations: zxcvbnEn.translations,
+});
+// 4 of 4 means roughly 10^10 guesses or more. At 3, "Summer2026!!!" passes.
+const MIN_PASSWORD_SCORE = 4;
+// Add your product and company names: users reach for them.
+const KNOWN_WORDS: string[] = [];
 
 const createUserSchema = z.object({
-  body: z.object({
-    name: z.string().min(1),
-    email: z.string().email(),
-    password: z.string().min(8),
-  }),
+  body: z
+    .object({
+      name: z.string().min(1),
+      email: z.string().email(),
+      // bcrypt ignores input past 72 bytes, so cap the length.
+      password: z.string().min(12).max(72),
+    })
+    .refine(
+      // The user's own name and email count as known words.
+      (body) =>
+        zxcvbn.check(body.password, [body.name, body.email, ...KNOWN_WORDS])
+          .score >= MIN_PASSWORD_SCORE,
+      { message: "Password is too easy to guess", path: ["password"] },
+    ),
 });
 
 router.post("/users", validate(createUserSchema), userController.createUser);
@@ -588,7 +628,7 @@ Key patterns covered in [references/advanced-patterns.md](./advanced-patterns.md
 
 ## Authentication & Authorization
 
-JWT-based auth with access tokens (short-lived, 15m) and refresh tokens (7d). Full `AuthService` implementation with `bcrypt` password comparison in [references/advanced-patterns.md](./advanced-patterns.md).
+JWT access tokens (short-lived, 15m) with opaque refresh tokens (7d) that are stored hashed, rotated on every use, and revoked on logout, password change, or reuse. Full `AuthService` implementation with `bcrypt` password comparison in [references/advanced-patterns.md](./advanced-patterns.md).
 
 ## Caching Strategies
 
